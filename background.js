@@ -21,7 +21,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         console.error('No Readwise API token found in storage');
         chrome.notifications.create({
           type: 'basic',
-          iconUrl: 'icon48.png', // ensure this icon exists in your package
+          iconUrl: 'icon48.png',
           title: 'Missing API Key',
           message: 'No Readwise API key found. Right-click on the extension, go to Options, and input your API key.'
         });
@@ -38,41 +38,46 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         console.log(`Processing ${tabs.length} tabs...`);
 
+        // Send initial progress
+        chrome.runtime.sendMessage({
+          type: 'progress',
+          percent: 0
+        });
+
         for (let i = 0; i < tabs.length; i += BATCH_SIZE) {
           const batch = tabs.slice(i, i + BATCH_SIZE);
           
-          // Filter for valid tabs (NEW)
+          // Filter for valid tabs
           const validTabs = batch.filter(tab =>
-            tab.id &&
-            !tab.closed &&
-            !tabStatus.has(tab.id)
+            tab.id && !tab.closed && !tabStatus.has(tab.id)
           );
 
           const results = await Promise.allSettled(
             validTabs.map(async (tab) => {
               let finalUrl = tab.url;
               
-              // Handle Tab Suspender parked pages
-              if (tab.url.startsWith('chrome-extension://fiabciakcmgepblmdkmemdbbkilneeeh')) {
-                const urlParams = new URL(tab.url).searchParams;
-                const parkedUrl = urlParams.get('url');
-                // Double decoding to ensure proper URL extraction (NEW)
-                finalUrl = parkedUrl ? decodeURIComponent(decodeURIComponent(parkedUrl)) : tab.url;
+              // Improved Tab Suspender handling
+              if (tab.url.includes('parked.html')) {
+                try {
+                  const urlParams = new URL(tab.url).searchParams;
+                  const parkedUrl = urlParams.get('url');
+                  finalUrl = parkedUrl ? decodeURIComponent(parkedUrl) : tab.url;
+                } catch (e) {
+                  console.warn('URL decoding failed:', e);
+                }
               }
 
-              // Block internal URLs (NEW)
-              if (finalUrl.includes('chrome-extension://') || finalUrl.includes('about:')) {
+              // Platform-agnostic internal URL check
+              if (/^(chrome|about):/.test(finalUrl)) {
                 console.log(`Blocked internal URL: ${finalUrl}`);
                 return { status: 'blocked', url: finalUrl };
               }
 
-              // Existing validation
               if (!isValidUrl(finalUrl)) {
                 console.warn(`Skipping invalid URL: ${finalUrl}`);
                 return { status: 'skipped', url: finalUrl };
               }
 
-              // Mark tab as processing (NEW)
               tabStatus.set(tab.id, 'processing');
 
               for (let attempt = 1; attempt <= RETRY_LIMIT; attempt++) {
@@ -87,46 +92,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       url: finalUrl,
                       location: "new",
                       category: "article",
-                      saved_from: "TabKondo" // NEW: source identifier
+                      saved_from: "TabKondo"
                     })
                   });
 
-                  // Rate limit handling
                   if (response.status === 429) {
                     const retryAfter = response.headers.get('Retry-After') || 2;
                     await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
                     continue;
                   }
 
-                  // Enhanced error handling for validation errors
                   if (response.status === 400) {
                     const errorData = await response.json();
-                    console.error('Validation Error:', errorData.detail);
                     throw new Error(`API Validation Failed: ${errorData.detail}`);
                   }
 
                   if (!response.ok) {
-                    const errorBody = await response.text();
-                    throw new Error(`HTTP ${response.status}: ${errorBody}`);
+                    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
                   }
 
-                  // Safe tab removal (NEW)
                   try {
-                    await chrome.tabs.get(tab.id);
                     await chrome.tabs.remove(tab.id);
-                    console.log(`Closed tab: ${tab.id}`);
                   } catch (error) {
                     console.log(`Tab ${tab.id} already closed`);
                   }
 
                   successCount++;
-                  tabStatus.set(tab.id, 'completed'); // NEW: mark as complete
+                  tabStatus.set(tab.id, 'completed');
                   return { status: 'success', url: finalUrl };
                 } catch (error) {
-                  console.error(`Attempt ${attempt} failed for ${finalUrl}:`, error);
+                  console.error(`Attempt ${attempt} failed:`, error);
                   if (attempt === RETRY_LIMIT) {
                     failCount++;
-                    tabStatus.delete(tab.id); // NEW: remove failed tab from tracker
+                    tabStatus.delete(tab.id);
                     return { status: 'failed', url: finalUrl, error: error.message };
                   }
                 }
@@ -134,11 +132,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             })
           );
 
-          console.log(`Batch ${i / BATCH_SIZE + 1} complete:`, results);
+          // Update progress after each batch
+          const percentComplete = Math.floor((i / tabs.length) * 100);
+          chrome.runtime.sendMessage({
+            type: 'progress',
+            percent: percentComplete
+          });
+
           await new Promise(resolve => setTimeout(resolve, REQUEST_DELAY));
         }
 
-        console.log(`Process complete. Success: ${successCount}, Failed: ${failCount}`);
+        // Final completion message
+        chrome.runtime.sendMessage({
+          type: 'complete',
+          successCount: successCount,
+          failCount: failCount
+        });
+
         chrome.notifications.create({
           type: 'basic',
           iconUrl: 'icon48.png',
@@ -148,8 +158,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       } catch (error) {
         console.error('Global error:', error);
+        chrome.runtime.sendMessage({
+          type: 'error',
+          error: error.message
+        });
       } finally {
-        tabStatus.clear(); // NEW: clear tracker after processing
+        tabStatus.clear();
       }
     });
   }
